@@ -36,9 +36,6 @@ DEFAULT_MAX_SOURCE_POSITIONS = 1024
 DEFAULT_MAX_TARGET_POSITIONS = 1024
 
 
-DEFAULT_MIN_PARAMS_TO_WRAP = int(1e8)
-
-
 @register_model("transformer")
 class TransformerModel(FairseqEncoderDecoderModel):
     """
@@ -194,18 +191,18 @@ class TransformerModel(FairseqEncoderDecoderModel):
                             help='block size of quantization noise at training time')
         parser.add_argument('--quant-noise-scalar', type=float, metavar='D', default=0,
                             help='scalar quantization noise and scalar quantization at training time')
-        # args for Fully Sharded Data Parallel (FSDP) training
-        parser.add_argument(
-            '--min-params-to-wrap', type=int, metavar='D', default=DEFAULT_MIN_PARAMS_TO_WRAP,
-            help=(
-                'minimum number of params for a layer to be wrapped with FSDP() when '
-                'training with --ddp-backend=fully_sharded. Smaller values will '
-                'improve memory efficiency, but may make torch.distributed '
-                'communication less efficient due to smaller input sizes. This option '
-                'is set to 0 (i.e., always wrap) when --checkpoint-activations or '
-                '--offload-activations are passed.'
-            )
-        )
+        parser.add_argument('--adapter-projection-dim', type=int, metavar='N',
+                            help='dimension of the down projection of the adapters')
+        parser.add_argument('--lang-pairs-adapters', default=None, metavar='PAIRS',
+                            help='comma-separated list of language pairs that will have adapters')
+        parser.add_argument('--freeze-adapters', action='store_true',
+                            help='variable to decide if it is time to train the adapters or not')
+        parser.add_argument('--freeze-layers', action='store_true',
+                            help='variable to decide if it is time to freeze all the other layers')
+        parser.add_argument('--freeze-embeddings', action='store_true',
+                            help='variable to decide if it is time to freeze embeddings')
+        parser.add_argument('--adapters-type', default=None)
+        parser.add_argument('--languages-adapters', default=None)
         # fmt: on
 
     @classmethod
@@ -257,12 +254,8 @@ class TransformerModel(FairseqEncoderDecoderModel):
         encoder = cls.build_encoder(args, src_dict, encoder_embed_tokens)
         decoder = cls.build_decoder(args, tgt_dict, decoder_embed_tokens)
         if not args.share_all_embeddings:
-            min_params_to_wrap = getattr(
-                args, "min_params_to_wrap", DEFAULT_MIN_PARAMS_TO_WRAP
-            )
-            # fsdp_wrap is a no-op when --ddp-backend != fully_sharded
-            encoder = fsdp_wrap(encoder, min_num_params=min_params_to_wrap)
-            decoder = fsdp_wrap(decoder, min_num_params=min_params_to_wrap)
+            encoder = fsdp_wrap(encoder, min_num_params=1e8)
+            decoder = fsdp_wrap(decoder, min_num_params=1e8)
         return cls(args, encoder, decoder)
 
     @classmethod
@@ -275,6 +268,11 @@ class TransformerModel(FairseqEncoderDecoderModel):
         if path:
             embed_dict = utils.parse_embedding(path)
             utils.load_embedding(embed_dict, dictionary, emb)
+
+        freeze_embeddings=getattr(args, "freeze_embeddings", False)
+        if freeze_embeddings:
+            freeze_module_params(emb)
+
         return emb
 
     @classmethod
@@ -406,17 +404,10 @@ class TransformerEncoder(FairseqEncoder):
 
     def build_encoder_layer(self, args):
         layer = TransformerEncoderLayer(args)
-        checkpoint = getattr(args, "checkpoint_activations", False)
-        if checkpoint:
+        if getattr(args, "checkpoint_activations", False):
             offload_to_cpu = getattr(args, "offload_activations", False)
             layer = checkpoint_wrapper(layer, offload_to_cpu=offload_to_cpu)
-        # if we are checkpointing, enforce that FSDP always wraps the
-        # checkpointed layer, regardless of layer size
-        min_params_to_wrap = (
-            getattr(args, "min_params_to_wrap", DEFAULT_MIN_PARAMS_TO_WRAP)
-            if not checkpoint else 0
-        )
-        layer = fsdp_wrap(layer, min_num_params=min_params_to_wrap)
+        layer = fsdp_wrap(layer, min_num_params=1e8)
         return layer
 
     def forward_embedding(
@@ -509,9 +500,8 @@ class TransformerEncoder(FairseqEncoder):
         has_pads = (src_tokens.device.type == "xla" or encoder_padding_mask.any())
 
         x, encoder_embedding = self.forward_embedding(src_tokens, token_embeddings)
-
         # account for padding while computing the representation
-        if has_pads:
+        if encoder_padding_mask is not None:
             x = x * (1 - encoder_padding_mask.unsqueeze(-1).type_as(x))
 
         # B x T x C -> T x B x C
@@ -754,17 +744,10 @@ class TransformerDecoder(FairseqIncrementalDecoder):
 
     def build_decoder_layer(self, args, no_encoder_attn=False):
         layer = TransformerDecoderLayer(args, no_encoder_attn)
-        checkpoint = getattr(args, "checkpoint_activations", False)
-        if checkpoint:
+        if getattr(args, "checkpoint_activations", False):
             offload_to_cpu = getattr(args, "offload_activations", False)
             layer = checkpoint_wrapper(layer, offload_to_cpu=offload_to_cpu)
-        # if we are checkpointing, enforce that FSDP always wraps the
-        # checkpointed layer, regardless of layer size
-        min_params_to_wrap = (
-            getattr(args, "min_params_to_wrap", DEFAULT_MIN_PARAMS_TO_WRAP)
-            if not checkpoint else 0
-        )
-        layer = fsdp_wrap(layer, min_num_params=min_params_to_wrap)
+        layer = fsdp_wrap(layer, min_num_params=1e8)
         return layer
 
     def forward(
@@ -1038,6 +1021,10 @@ def Linear(in_features, out_features, bias=True):
         nn.init.constant_(m.bias, 0.0)
     return m
 
+def freeze_module_params(m):
+    if m is not None:
+        for p in m.parameters():
+            p.requires_grad = False 
 
 @register_model_architecture("transformer", "transformer_tiny")
 def tiny_architecture(args):

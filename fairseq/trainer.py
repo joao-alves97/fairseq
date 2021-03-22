@@ -440,16 +440,12 @@ class Trainer(object):
             # load model parameters
             try:
                 self.model.load_state_dict(
-                    state["model"], strict=True, model_cfg=self.cfg.model
+                    state["model"], strict=False, model_cfg=self.cfg.model
                 )
-                # save memory for later steps
-                del state["model"]
                 if utils.has_parameters(self.get_criterion()):
                     self.get_criterion().load_state_dict(
-                        state["criterion"], strict=True
+                        state["criterion"], strict=False
                     )
-                    del state["criterion"]
-
             except Exception:
                 raise Exception(
                     "Cannot load model parameters from checkpoint {}; "
@@ -1021,22 +1017,19 @@ class Trainer(object):
     def clip_grad_norm(self, clip_norm):
 
         def agg_norm_fn(total_norm):
-            total_norm = total_norm.cuda().float() ** 2
-            total_norm = distributed_utils.all_reduce(
-                total_norm, group=self.data_parallel_process_group
-            )
-            return total_norm ** 0.5
+            if self.cfg.distributed_training.ddp_backend == "fully_sharded":
+                total_norm = total_norm ** 2
+                if (
+                    self.data_parallel_process_group is not None
+                    or torch.distributed.is_initialized()
+                ):
+                    total_norm = distributed_utils.all_reduce(
+                        total_norm.cuda(), group=self.data_parallel_process_group
+                    )
+                total_norm = total_norm ** 0.5
+            return total_norm
 
-        should_agg_norm = (
-            self.cfg.distributed_training.ddp_backend == "fully_sharded"
-            and (
-                self.data_parallel_process_group is not None
-                or torch.distributed.is_initialized()
-            )
-        )
-        return self.optimizer.clip_grad_norm(
-            clip_norm, aggregate_norm_fn=agg_norm_fn if should_agg_norm else None
-        )
+        return self.optimizer.clip_grad_norm(clip_norm, aggregate_norm_fn=agg_norm_fn)
 
     def cumulative_training_time(self):
         if self._cumulative_training_time is None:
@@ -1169,7 +1162,10 @@ class Trainer(object):
         return logging_outputs, extra_stats_to_sum
 
     def _fast_stat_sync_sum(
-        self, logging_outputs: List[Dict[str, Any]], *extra_stats_to_sum, ignore=False,
+        self,
+        logging_outputs: List[Dict[str, Any]],
+        *extra_stats_to_sum,
+        ignore=False,
     ):
         """
         Sync logging outputs across workers. fast_stat_sync_sum is
